@@ -6,7 +6,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("Successfully connected to NATS");
 
-    let mut subscriber = client.subscribe("orbi.gps.location").await?;
+    let mut subscriber = client
+        .queue_subscribe("orbi.gps.location", String::from("gps-workers"))
+        .await?;
 
     println!("Listening for GPS messages...");
 

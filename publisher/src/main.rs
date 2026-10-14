@@ -5,13 +5,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Publisher connected to NATS");
 
     let subject = "orbi.gps.location";
-    let payload = "Vehicle ORBI-001 is moving";
 
-    client.publish(subject, payload.into()).await?;
+    for i in 1..=10 {
+        let payload = format!("GPS Message {}", i);
+
+        client.publish(subject, payload.into()).await?;
+
+        println!("Published message {}", i);
+    }
 
     client.flush().await?;
 
-    println!("Message published successfully");
+    println!("All 10 messages published");
 
     Ok(())
 }

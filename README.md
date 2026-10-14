@@ -143,13 +143,36 @@ Received: b"Vehicle ORBI-001 is moving"
 - Client/server synchronization using `flush()`
 - Core NATS at-most-once delivery semantics
 
+### Experiment 3: Queue Groups and Load Balancing
+
+Implemented NATS queue subscriptions using the `gps-workers` queue group.
+
+**Test configuration:**
+- Two independent Rust worker processes
+- One NATS subject: `orbi.gps.location`
+- Ten published messages
+- One shared queue group: `gps-workers`
+
+**Observed results:**
+
+| Worker | Messages received |
+|---|---|
+| Worker A | 1, 2, 3, 4, 6 |
+| Worker B | 5, 7, 8, 9, 10 |
+
+All ten messages were received, with no duplicate deliveries observed.
+
+The experiment demonstrated that NATS distributes messages among members of the same queue group without guaranteeing an equal split.
+
+**Reliability limitation:** Core NATS uses at-most-once delivery semantics. Messages are not automatically redelivered when a worker crashes after receiving them.
+
 ## Development Roadmap
 
 The following capabilities are planned and are not yet implemented.
 
 - [x] Core NATS publisher and subscriber
 - [x] Fan-out messaging experiment
-- [ ] Queue groups and load balancing
+- [x] Queue groups and load balancing
 - [ ] Structured JSON messages using Serde
 - [ ] JetStream persistence and message replay
 - [ ] Consumer acknowledgments and redelivery
