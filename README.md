@@ -166,6 +166,29 @@ The experiment demonstrated that NATS distributes messages among members of the 
 
 **Reliability limitation:** Core NATS uses at-most-once delivery semantics. Messages are not automatically redelivered when a worker crashes after receiving them.
 
+### Experiment 4: Structured GPS Telemetry with Serde
+
+Implemented structured messaging between independent Rust publisher and subscriber applications using Core NATS.
+
+**Implementation:**
+- Defined a `GpsTelemetry` struct containing device ID, latitude, longitude, and speed.
+- Serialized Rust telemetry into JSON bytes using `serde_json::to_vec()`.
+- Published the JSON payload to `orbi.gps.location`.
+- Deserialized received bytes into a strongly typed Rust struct using `serde_json::from_slice()`.
+- Implemented error handling with `match` to skip invalid messages without terminating the subscriber.
+
+**Verified results:**
+- Successfully transmitted and reconstructed GPS telemetry.
+- Confirmed that missing required fields cause deserialization errors.
+- Confirmed that the subscriber can remain running after a malformed message.
+- Successfully processed valid GPS telemetry.
+
+**Current limitations:**
+
+Core NATS provides at-most-once delivery. Invalid messages are logged and skipped, without persistence, retry, or dead-letter handling.
+
+**Next milestone:** Explore JetStream persistence, acknowledgments, and redelivery.
+
 ## Development Roadmap
 
 The following capabilities are planned and are not yet implemented.
@@ -173,7 +196,7 @@ The following capabilities are planned and are not yet implemented.
 - [x] Core NATS publisher and subscriber
 - [x] Fan-out messaging experiment
 - [x] Queue groups and load balancing
-- [ ] Structured JSON messages using Serde
+- [x] Structured JSON messages using Serde
 - [ ] JetStream persistence and message replay
 - [ ] Consumer acknowledgments and redelivery
 - [ ] Retry strategies and dead-letter handling
