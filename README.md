@@ -189,24 +189,197 @@ Core NATS provides at-most-once delivery. Invalid messages are logged and skippe
 
 **Next milestone:** Explore JetStream persistence, acknowledgments, and redelivery.
 
+## JetStream: Persistent and Reliable Messaging
+
+The project has progressed from Core NATS to NATS JetStream to explore persistent messaging, durable consumers, explicit acknowledgments, and message redelivery.
+
+JetStream extends NATS with server-managed streams and consumers while retaining subject-based message routing.
+
+### Architecture
+
+```text
+Rust GPS Publisher
+        |
+        | Subject: orbi.gps.location
+        v
+    NATS Server
+        |
+        +-- JetStream Stream: ORBI_GPS
+        |       |
+        |       +-- File-backed message storage
+        |
+        +-- Durable Pull Consumer: GPS_PROCESSOR
+                |
+                +-- Delivery tracking
+                +-- Acknowledgment tracking
+                +-- Redelivery of unacknowledged messages
+                        |
+                        v
+                Rust GPS Worker
+                        |
+                        +-- Process telemetry
+                        +-- Send explicit ACK
+```
+
+The stream stores messages, the consumer manages delivery state, and the Rust application performs the actual processing.
+
+### Running NATS with JetStream
+
+```bash
+docker run -d \
+  --name nats-lab \
+  -p 127.0.0.1:4222:4222 \
+  -p 127.0.0.1:8222:8222 \
+  -v nats-lab-data:/data \
+  nats:2.12 \
+  -js \
+  -sd /data
+```
+
+The named Docker volume provides persistent storage across container restarts and replacements, provided the volume is retained.
+
+This configuration uses a single NATS server and does not provide high availability.
+
+### JetStream Applications
+
+**Stream administrator**
+
+```bash
+cargo run -p stream-admin
+```
+
+Creates or retrieves the `ORBI_GPS` stream, configured to capture `orbi.gps.location` with file-backed storage, and displays the stored-message count.
+
+**JetStream processing worker**
+
+```bash
+cargo run -p subscriber --bin jetstream_worker
+```
+
+Uses the durable pull consumer `GPS_PROCESSOR` to retrieve messages, acknowledge processing, and inspect consumer state.
+
+### Experiment 5: Persistent Message Storage
+
+Published structured GPS telemetry while no application subscriber was running.
+
+Verified that `ORBI_GPS` retained the message and reported one stored message.
+
+**Result:** JetStream retained the message independently of an active application subscriber.
+
+### Experiment 6: Persistence Across Server Restart
+
+Restarted the NATS container:
+
+```bash
+docker restart nats-lab
+```
+
+Queried the stream again using `stream-admin`.
+
+**Result:** The previously stored GPS message remained available after the restart.
+
+This demonstrates local persistence, not replicated fault tolerance.
+
+### Experiment 7: Durable Consumer and Redelivery
+
+Created the durable pull consumer `GPS_PROCESSOR` with explicit acknowledgment policy.
+
+Fetched a GPS message without acknowledging it, then restarted the Rust worker after the acknowledgment timeout.
+
+**Observed state:**
+
+```text
+Pending messages: 0
+Awaiting ACK: 1
+Redelivered messages: 1
+```
+
+The same GPS telemetry was delivered again.
+
+**Result:** Unacknowledged deliveries can be retried, providing the foundation for at-least-once processing.
+
+### Experiment 8: Explicit Acknowledgment
+
+Updated the Rust worker to acknowledge successful message processing:
+
+```rust
+message.ack().await?;
+```
+
+Inspected the durable consumer after processing.
+
+**Observed state:**
+
+```text
+Pending messages: 0
+Awaiting ACK: 0
+Redelivered messages: 0
+```
+
+**Result:** JetStream recorded the acknowledgment and cleared the outstanding delivery state.
+
+Under the stream's default limits-based retention policy, acknowledgment does not automatically delete the stored message.
+
+### Engineering Lessons
+
+- Core NATS and JetStream provide different delivery and persistence capabilities.
+- A JetStream stream stores messages; a durable consumer tracks delivery progress.
+- Durable consumer state survives application worker restarts.
+- A delivered message is not necessarily an acknowledged message.
+- At-least-once delivery requires application-level idempotency to handle duplicates safely.
+- Persistent storage does not automatically provide high availability.
+- A basic acknowledgment send is different from a server-confirmed acknowledgment.
+
+### Next JetStream Milestones
+
+- Confirmed publish and acknowledgment operations
+- Typed GPS telemetry processing
+- Retry policies and maximum delivery attempts
+- Dead-letter handling
+- Idempotent PostgreSQL writes
+- Multiple workers sharing a durable pull consumer
+- Failure recovery, monitoring, and performance testing
+
 ## Development Roadmap
 
-The following capabilities are planned and are not yet implemented.
+The following checklist tracks implemented and experimentally verified capabilities, alongside upcoming work.
+
+### Core NATS
 
 - [x] Core NATS publisher and subscriber
 - [x] Fan-out messaging experiment
 - [x] Queue groups and load balancing
 - [x] Structured JSON messages using Serde
-- [ ] JetStream persistence and message replay
-- [ ] Consumer acknowledgments and redelivery
-- [ ] Retry strategies and dead-letter handling
+- [x] Malformed message handling
+
+### NATS JetStream
+
+- [x] JetStream server configuration with persistent Docker storage
+- [x] File-backed stream creation (`ORBI_GPS`)
+- [x] Message persistence without active subscribers
+- [x] Message persistence across server restarts
+- [x] Durable pull consumer creation (`GPS_PROCESSOR`)
+- [x] Pull-based message fetching
+- [x] Explicit consumer acknowledgments
+- [x] Unacknowledged message redelivery
+- [x] Consumer acknowledgment state inspection
+- [ ] Message replay and delivery policies
+- [ ] JetStream publish acknowledgments
+- [ ] Server-confirmed consumer acknowledgments
+- [ ] Retry strategies and acknowledgment timeouts
+- [ ] Maximum delivery attempts and dead-letter handling
 - [ ] Idempotent message processing
+- [ ] Multiple workers sharing a durable pull consumer
 - [ ] Reconnection and failure recovery
+
+### Testing, Operations and Deployment
+
 - [ ] Integration and automated testing
 - [ ] Observability and monitoring
-- [ ] Containerized application deployment
+- [ ] Containerized Rust application deployment
 - [ ] Kubernetes deployment and scaling
 - [ ] Performance and reliability experiments
+- [ ] JetStream clustering and replication experiments
 
 ## Engineering Goals
 
