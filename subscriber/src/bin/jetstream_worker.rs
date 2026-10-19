@@ -45,9 +45,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         println!("{}", String::from_utf8_lossy(&message.payload));
 
         // Acknowledge successful processing.
-        message.ack().await?;
+        message.double_ack().await?;
 
-        println!("GPS message acknowledged successfully.");
+        println!("GPS message acknowledgment confirmed by JetStream.");
 
         // Refresh the consumer state after acknowledging.
         let updated_info = consumer.info().await?;

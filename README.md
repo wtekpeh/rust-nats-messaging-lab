@@ -51,8 +51,16 @@ rust-nats-messaging-lab/
 ├── publisher/
 │   ├── Cargo.toml
 │   └── src/
-│       └── main.rs
+│       ├── main.rs
+│       └── bin/
+│           └── jetstream_publisher.rs
 ├── subscriber/
+│   ├── Cargo.toml
+│   └── src/
+│       ├── main.rs
+│       └── bin/
+│           └── jetstream_worker.rs
+├── stream-admin/
 │   ├── Cargo.toml
 │   └── src/
 │       └── main.rs
@@ -258,6 +266,8 @@ cargo run -p subscriber --bin jetstream_worker
 
 Uses the durable pull consumer `GPS_PROCESSOR` to retrieve messages, acknowledge processing, and inspect consumer state.
 
+cargo run -p publisher --bin jetstream_publisher
+
 ### Experiment 5: Persistent Message Storage
 
 Published structured GPS telemetry while no application subscriber was running.
@@ -320,6 +330,52 @@ Redelivered messages: 0
 
 Under the stream's default limits-based retention policy, acknowledgment does not automatically delete the stored message.
 
+### Experiment 9: JetStream Publish Acknowledgments
+
+Implemented a dedicated JetStream publisher in `publisher/src/bin/jetstream_publisher.rs`, preserving the original Core NATS publisher for comparison.
+
+**Implementation:**
+- Connected to the NATS server using `async-nats`.
+- Created a JetStream context.
+- Serialized structured GPS telemetry into JSON.
+- Published to `orbi.gps.location`.
+- Awaited JetStream's publish acknowledgment.
+- Inspected the returned stream name and sequence number.
+
+**Verified output:**
+
+```text
+JetStream publish acknowledged!
+Stream: ORBI_GPS
+Sequence: 2
+```
+
+Queried the stream using `stream-admin` and confirmed that it contained two stored messages.
+
+**Result:** The publisher received confirmation that JetStream accepted and stored the GPS message. Unlike Core NATS `flush()`, the JetStream publish acknowledgment explicitly confirms stream acceptance.
+
+### Experiment 10: Server-Confirmed Consumer Acknowledgments
+
+Updated `subscriber/src/bin/jetstream_worker.rs` to use:
+
+```rust
+message.double_ack().await?;
+```
+
+This waits for JetStream to confirm receipt of the consumer acknowledgment, rather than only sending the acknowledgment.
+
+**Observed consumer state:**
+
+| Metric | Before processing | After confirmed ACK |
+|---|---:|---:|
+| Pending messages | 1 | 0 |
+| Awaiting ACK | 0 | 0 |
+| Redelivered messages | 0 | 0 |
+
+**Result:** The durable consumer `GPS_PROCESSOR` successfully processed the second GPS message, and JetStream confirmed its acknowledgment.
+
+Server-confirmed acknowledgments improve delivery-state certainty but do not make external database writes and message acknowledgments atomic.
+
 ### Engineering Lessons
 
 - Core NATS and JetStream provide different delivery and persistence capabilities.
@@ -364,8 +420,8 @@ The following checklist tracks implemented and experimentally verified capabilit
 - [x] Unacknowledged message redelivery
 - [x] Consumer acknowledgment state inspection
 - [ ] Message replay and delivery policies
-- [ ] JetStream publish acknowledgments
-- [ ] Server-confirmed consumer acknowledgments
+- [x] JetStream publish acknowledgments
+- [x] Server-confirmed consumer acknowledgments
 - [ ] Retry strategies and acknowledgment timeouts
 - [ ] Maximum delivery attempts and dead-letter handling
 - [ ] Idempotent message processing
@@ -393,6 +449,8 @@ The repository will evolve incrementally, with each major feature supported by p
 
 ## Project Status
 
-**Active development — Core NATS publish/subscribe completed.**
+**Active development — Core NATS experiments completed; JetStream persistence, durable consumers, redelivery, and confirmed acknowledgments experimentally verified.**
+
+Next focus: idempotent message processing, retry strategies, and failure recovery.
 
 This repository is an evolving engineering lab. Additional messaging capabilities will be introduced and documented as development progresses.
