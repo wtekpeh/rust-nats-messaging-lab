@@ -19,7 +19,9 @@ The learning approach combines theoretical understanding with practical Rust imp
 | Rust | Publisher and subscriber applications |
 | Tokio | Asynchronous runtime |
 | async-nats | Rust NATS client |
-| NATS Server | Messaging broker |
+| NATS Server / JetStream | Core messaging, persistent streams, and durable consumers |
+| PostgreSQL | Durable GPS event storage and uniqueness constraints |
+| SQLx | Asynchronous PostgreSQL access and schema migrations |
 | Docker | Local broker deployment |
 | Cargo Workspace | Multi-crate project management |
 | GitHub | Version control and project documentation |
@@ -59,11 +61,15 @@ rust-nats-messaging-lab/
 │   └── src/
 │       ├── main.rs
 │       └── bin/
-│           └── jetstream_worker.rs
+│           ├── jetstream_worker.rs
+│           └── consumer_info.rs
 ├── stream-admin/
 │   ├── Cargo.toml
 │   └── src/
 │       └── main.rs
+├── migrations/
+│   └── 20261023223631_create_gps_events.sql
+├── .env                 # Local only; not committed
 ├── .gitignore
 └── README.md
 
@@ -246,7 +252,7 @@ docker run -d \
 
 The named Docker volume provides persistent storage across container restarts and replacements, provided the volume is retained.
 
-This configuration uses a single NATS server and does not provide high availability.
+This configuration uses a single NATS server and does not provide high availability. HTTP monitoring on port `8222` requires the additional NATS flag `-m 8222`; merely publishing the Docker port does not enable monitoring.
 
 ### JetStream Applications
 
@@ -376,6 +382,93 @@ This waits for JetStream to confirm receipt of the consumer acknowledgment, rath
 
 Server-confirmed acknowledgments improve delivery-state certainty but do not make external database writes and message acknowledgments atomic.
 
+### Experiment 11: PostgreSQL Persistence with SQLx
+
+Added SQLx to the Rust JetStream worker and created the dedicated `rust_nats_lab` PostgreSQL database. The migration `migrations/20261023223631_create_gps_events.sql` creates `gps_events` with `event_id TEXT PRIMARY KEY`, `device_id`, latitude, longitude, speed, and a database-generated `received_at` timestamp.
+
+The worker uses a Tokio-compatible SQLx PostgreSQL connection pool (`PgPoolOptions`, maximum five connections). It inserts telemetry before acknowledging delivery to JetStream.
+
+**Verified result:** JetStream sequence 7, carrying `GPS-001`, was inserted into PostgreSQL; SQLx reported `rows_affected() = 1`, and the worker then received a confirmed JetStream ACK.
+
+### Experiment 12: Durable Database-Backed Idempotency
+
+Replaced the worker's in-memory `HashSet` with a PostgreSQL uniqueness constraint and conflict-safe insertion:
+
+```sql
+INSERT INTO gps_events (event_id, device_id, latitude, longitude, speed_kmh)
+VALUES ($1, $2, $3, $4, $5)
+ON CONFLICT (event_id) DO NOTHING;
+```
+
+SQLx's `rows_affected()` distinguishes a new row (`1`) from a duplicate (`0`). This prevents duplicate GPS rows across worker restarts and competing database inserts.
+
+**Verified result:** Publishing `GPS-001` again at JetStream sequence 8 caused the worker to log a duplicate, skip insertion, and acknowledge the delivery. A PostgreSQL query confirmed exactly one `GPS-001` row.
+
+**Scope:** This guarantees idempotent database insertion for a given event ID, not exactly-once message delivery or exactly-once execution of arbitrary external side effects.
+
+### Experiment 13: Crash After Database Commit, Before ACK
+
+Simulated an abrupt worker termination with `std::process::exit(1)` after the SQLx insert succeeded but before `message.double_ack().await?` for event `GPS-CRASH-001`. The temporary crash condition was removed after the experiment.
+
+**Observed sequence:**
+
+1. JetStream accepted `GPS-CRASH-001` at stream sequence 9.
+2. PostgreSQL persisted the event successfully.
+3. The worker exited before acknowledging the delivery.
+4. A separate Rust diagnostic (`subscriber/src/bin/consumer_info.rs`) reported `Awaiting ACK: 1`.
+5. The restarted worker received the event again; PostgreSQL identified it as a duplicate.
+6. The worker sent a server-confirmed acknowledgment.
+7. The final diagnostic showed `Pending messages: 0` and `Awaiting ACK: 0`.
+
+**Result:** At-least-once delivery combined with durable, idempotent PostgreSQL writes safely recovered from a crash between the database commit and message acknowledgment. The database write and JetStream ACK are not a single atomic transaction.
+
+### Running the PostgreSQL-Backed JetStream Worker
+
+Prerequisites: NATS with JetStream enabled, PostgreSQL reachable at `127.0.0.1:5432`, and the SQLx CLI for migrations. Create the `rust_nats_lab` database before applying migrations.
+
+Create a **local, untracked** `.env` file at the workspace root:
+
+```dotenv
+DATABASE_URL=postgresql://postgres:YOUR_PASSWORD@127.0.0.1:5432/rust_nats_lab
+```
+
+Do not commit `.env` or real credentials. Run migrations:
+
+```bash
+cargo sqlx migrate run
+```
+
+The current Rust worker reads `DATABASE_URL` from the process environment. For a trusted, shell-compatible local `.env` file, load it into the current shell before running the worker:
+
+```bash
+set -a
+source .env
+set +a
+```
+
+Start the publisher and worker (in separate terminal sessions if needed):
+
+```bash
+cargo run -p publisher --bin jetstream_publisher
+cargo run -p subscriber --bin jetstream_worker
+```
+
+Inspect the durable consumer without fetching or acknowledging messages:
+
+```bash
+cargo run -p subscriber --bin consumer_info
+```
+
+Check persisted records in the existing development PostgreSQL container:
+
+```bash
+docker exec dev_postgres \
+  psql -U postgres -d rust_nats_lab \
+  -c "SELECT event_id, device_id, received_at FROM gps_events;"
+```
+
+The `dev_postgres` container is part of this lab's local environment; other setups may use a different container or PostgreSQL host.
+
 ### Engineering Lessons
 
 - Core NATS and JetStream provide different delivery and persistence capabilities.
@@ -385,16 +478,16 @@ Server-confirmed acknowledgments improve delivery-state certainty but do not mak
 - At-least-once delivery requires application-level idempotency to handle duplicates safely.
 - Persistent storage does not automatically provide high availability.
 - A basic acknowledgment send is different from a server-confirmed acknowledgment.
+- Persisting data before ACK enables safe recovery when combined with idempotent writes.
+- An acknowledged message and a committed database transaction are independent operations.
 
 ### Next JetStream Milestones
 
-- Confirmed publish and acknowledgment operations
-- Typed GPS telemetry processing
-- Retry policies and maximum delivery attempts
-- Dead-letter handling
-- Idempotent PostgreSQL writes
+- Retry policies, backoff, and maximum delivery attempts
+- Poison-message handling and dead-letter workflows
 - Multiple workers sharing a durable pull consumer
-- Failure recovery, monitoring, and performance testing
+- Automated integration tests and failure-injection experiments
+- Observability, monitoring, and performance testing
 
 ## Development Roadmap
 
@@ -424,9 +517,20 @@ The following checklist tracks implemented and experimentally verified capabilit
 - [x] Server-confirmed consumer acknowledgments
 - [ ] Retry strategies and acknowledgment timeouts
 - [ ] Maximum delivery attempts and dead-letter handling
-- [ ] Idempotent message processing
+- [x] PostgreSQL-backed idempotent GPS inserts
 - [ ] Multiple workers sharing a durable pull consumer
-- [ ] Reconnection and failure recovery
+- [x] Recovery from worker crash after PostgreSQL commit and before ACK
+- [ ] Reconnection handling and broader failure recovery
+
+### PostgreSQL and SQLx
+
+- [x] Dedicated PostgreSQL lab database
+- [x] Version-controlled SQLx schema migration
+- [x] SQLx asynchronous connection pool
+- [x] Persist GPS telemetry before JetStream ACK
+- [x] Database-enforced unique event IDs
+- [x] Consumer-state diagnostic binary
+- [ ] Automated database integration tests
 
 ### Testing, Operations and Deployment
 
@@ -449,8 +553,8 @@ The repository will evolve incrementally, with each major feature supported by p
 
 ## Project Status
 
-**Active development — Core NATS experiments completed; JetStream persistence, durable consumers, redelivery, and confirmed acknowledgments experimentally verified.**
+**Active development — Core NATS, JetStream persistence, durable consumers, confirmed acknowledgments, PostgreSQL-backed idempotency, and worker crash recovery experimentally verified.**
 
-Next focus: idempotent message processing, retry strategies, and failure recovery.
+Next focus: retry strategies, backoff, maximum delivery attempts, and dead-letter handling.
 
 This repository is an evolving engineering lab. Additional messaging capabilities will be introduced and documented as development progresses.

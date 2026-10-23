@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Serialize, Deserialize)]
 struct GpsTelemetry {
+    event_id: String,
     device_id: String,
     latitude: f64,
     longitude: f64,
@@ -21,6 +22,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Prepare GPS telemetry.
     let telemetry = GpsTelemetry {
+        event_id: "GPS-CRASH-001".to_string(),
         device_id: "ORBI-001".to_string(),
         latitude: 5.6037,
         longitude: -0.1870,
