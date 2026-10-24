@@ -60,18 +60,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     println!("Awaiting ACK: {}", info.num_ack_pending);
     println!("Redelivered messages: {}", info.num_redelivered);
 
-    // Request one message from the durable pull consumer.
-    let mut messages = consumer.fetch().max_messages(2).messages().await?;
+    loop {
+        // Request one message from the durable pull consumer.
+        let mut messages = consumer.fetch().messages().await?;
 
-    while let Some(message_result) = messages.next().await {
-        let message = message_result?;
+        while let Some(message_result) = messages.next().await {
+            let message = message_result?;
 
-        let telemetry: GpsTelemetry = serde_json::from_slice(&message.payload)?;
+            let telemetry: GpsTelemetry = serde_json::from_slice(&message.payload)?;
 
-        println!("Received GPS event: {}", telemetry.event_id);
+            println!("Received GPS event: {}", telemetry.event_id);
 
-        let result = sqlx::query(
-            r#"
+            let result = sqlx::query(
+                r#"
     INSERT INTO gps_events (
         event_id,
         device_id,
@@ -82,39 +83,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     VALUES ($1, $2, $3, $4, $5)
     ON CONFLICT (event_id) DO NOTHING
     "#,
-        )
-        .bind(&telemetry.event_id)
-        .bind(&telemetry.device_id)
-        .bind(telemetry.latitude)
-        .bind(telemetry.longitude)
-        .bind(telemetry.speed_kmh)
-        .execute(&pool)
-        .await?;
+            )
+            .bind(&telemetry.event_id)
+            .bind(&telemetry.device_id)
+            .bind(telemetry.latitude)
+            .bind(telemetry.longitude)
+            .bind(telemetry.speed_kmh)
+            .execute(&pool)
+            .await?;
 
-        if result.rows_affected() == 1 {
-            println!("New GPS event persisted successfully.");
-            println!("Device ID: {}", telemetry.device_id);
-            println!("Latitude: {}", telemetry.latitude);
-            println!("Longitude: {}", telemetry.longitude);
-            println!("Speed: {} km/h", telemetry.speed_kmh);
-        } else {
-            println!(
-                "Duplicate GPS event {}. Already stored in PostgreSQL. Skipping.",
-                telemetry.event_id
-            );
+            if result.rows_affected() == 1 {
+                println!("New GPS event persisted successfully.");
+                println!("Device ID: {}", telemetry.device_id);
+                println!("Latitude: {}", telemetry.latitude);
+                println!("Longitude: {}", telemetry.longitude);
+                println!("Speed: {} km/h", telemetry.speed_kmh);
+            } else {
+                println!(
+                    "Duplicate GPS event {}. Already stored in PostgreSQL. Skipping.",
+                    telemetry.event_id
+                );
+            }
+
+            // Acknowledge only after PostgreSQL has completed successfully.
+            message.double_ack().await?;
+            println!("GPS message acknowledgment confirmed by JetStream.");
         }
-
-        // Acknowledge only after PostgreSQL has completed successfully.
-        message.double_ack().await?;
-        println!("GPS message acknowledgment confirmed by JetStream.");
     }
-
-    let updated_info = consumer.info().await?;
-
-    println!("--- Consumer state after processing ---");
-    println!("Pending messages: {}", updated_info.num_pending);
-    println!("Awaiting ACK: {}", updated_info.num_ack_pending);
-    println!("Redelivered messages: {}", updated_info.num_redelivered);
-
-    Ok(())
 }

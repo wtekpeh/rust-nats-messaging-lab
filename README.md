@@ -28,21 +28,36 @@ The learning approach combines theoretical understanding with practical Rust imp
 
 ## Current Architecture
 
+Core NATS experiments demonstrate live publish/subscribe fan-out and queue groups. The durable JetStream pipeline is:
 
-                    NATS Server
-                   localhost:4222
-                         |
-          +--------------+--------------+
-          |                             |
-     Rust Publisher              Rust Subscribers
-          |                             |
-          |       Publish/Subscribe     |
-          +-----------------------------+
+```text
+Rust JetStream Publisher -- orbi.gps.location --> ORBI_GPS (file-backed stream)
+                                                      |
+                                             GPS_PROCESSOR (durable pull)
+                                                      |
+                                              Rust GPS Worker
+                                                      |
+                                         PostgreSQL gps_events (unique event_id)
+                                                      |
+                                          confirmed ACK after database write
 
-Subject: orbi.gps.location
+On max deliveries (3):
+  JetStream advisory --> ORBI_ADVISORIES (file-backed stream)
+                               |
+                      GPS_DLQ_HANDLER (durable pull)
+                               |
+                         Rust DLQ Handler
+                               |-- retrieve original ORBI_GPS message by stream_seq
+                               |-- publish structured record with Nats-Msg-Id
+                               v
+                      ORBI_GPS_DLQ (file-backed stream)
+                               |
+                       confirm publish ACK
+                               |
+                     confirm advisory ACK
+```
 
-
-The publisher sends messages to a NATS subject. The server routes each message to all active, matching independent subscribers.
+The streams store messages independently of application processes. Consumers track delivery and acknowledgment state; the Rust workers perform processing. The dead-letter flow **copies** the original payload into a structured record rather than deleting the original stream message.
 
 ## Repository Structure
 
@@ -62,6 +77,7 @@ rust-nats-messaging-lab/
 │       ├── main.rs
 │       └── bin/
 │           ├── jetstream_worker.rs
+│           ├── dlq_handler.rs
 │           └── consumer_info.rs
 ├── stream-admin/
 │   ├── Cargo.toml
@@ -95,7 +111,8 @@ cd rust-nats-messaging-lab
 docker run -d \
   --name nats-lab \
   -p 127.0.0.1:4222:4222 \
-  nats:2.12
+  -v nats-lab-data:/data \
+  nats:2.12 -js -sd /data
 
 
 Verify that the server is ready:
@@ -201,7 +218,7 @@ Implemented structured messaging between independent Rust publisher and subscrib
 
 Core NATS provides at-most-once delivery. Invalid messages are logged and skipped, without persistence, retry, or dead-letter handling.
 
-**Next milestone:** Explore JetStream persistence, acknowledgments, and redelivery.
+**Subsequent milestone (completed):** JetStream persistence, acknowledgments, and redelivery.
 
 ## JetStream: Persistent and Reliable Messaging
 
@@ -246,13 +263,12 @@ docker run -d \
   -p 127.0.0.1:8222:8222 \
   -v nats-lab-data:/data \
   nats:2.12 \
-  -js \
-  -sd /data
+  -js -sd /data -m 8222
 ```
 
 The named Docker volume provides persistent storage across container restarts and replacements, provided the volume is retained.
 
-This configuration uses a single NATS server and does not provide high availability. HTTP monitoring on port `8222` requires the additional NATS flag `-m 8222`; merely publishing the Docker port does not enable monitoring.
+This configuration uses a single NATS server and does not provide high availability. The `-m 8222` flag enables the HTTP monitoring endpoint on the mapped port.
 
 ### JetStream Applications
 
@@ -272,7 +288,9 @@ cargo run -p subscriber --bin jetstream_worker
 
 Uses the durable pull consumer `GPS_PROCESSOR` to retrieve messages, acknowledge processing, and inspect consumer state.
 
+```bash
 cargo run -p publisher --bin jetstream_publisher
+```
 
 ### Experiment 5: Persistent Message Storage
 
@@ -481,13 +499,86 @@ The `dev_postgres` container is part of this lab's local environment; other setu
 - Persisting data before ACK enables safe recovery when combined with idempotent writes.
 - An acknowledged message and a committed database transaction are independent operations.
 
-### Next JetStream Milestones
+### Experiment 14: Retry Policy, Backoff, and Maximum Deliveries
 
-- Retry policies, backoff, and maximum delivery attempts
-- Poison-message handling and dead-letter workflows
-- Multiple workers sharing a durable pull consumer
-- Automated integration tests and failure-injection experiments
-- Observability, monitoring, and performance testing
+Configured the durable pull consumer `GPS_PROCESSOR` with explicit acknowledgments, `max_deliver = 3`, and retry backoff intervals of 5 and 10 seconds. A deliberately unacknowledged GPS event was delivered three times. After the final acknowledgment timeout, JetStream generated a maximum-deliveries advisory.
+
+**Result:** Exhausted delivery attempts are observable through JetStream advisories; JetStream does not automatically transfer the original message to a dead-letter stream.
+
+### Experiment 15: Durable Failure Advisories
+
+Created file-backed `ORBI_ADVISORIES`, subscribed to `$JS.EVENT.ADVISORY.CONSUMER.MAX_DELIVERIES.ORBI_GPS.GPS_PROCESSOR`, and created the durable pull consumer `GPS_DLQ_HANDLER` with explicit acknowledgments, a 30-second ACK wait, and a five-delivery limit.
+
+**Result:** A maximum-deliveries advisory remained available even when the Rust DLQ handler was offline. Its JSON identified the original stream, consumer, stream sequence, delivery count, and advisory timestamp.
+
+### Experiment 16: Confirmed Dead-Letter Transfer
+
+Created file-backed `ORBI_GPS_DLQ` on subject `orbi.gps.dlq`. The Rust handler (`subscriber/src/bin/dlq_handler.rs`) consumes a failure advisory, retrieves the original message from `ORBI_GPS` using `get_raw_message(stream_seq)`, publishes it to the DLQ, waits for the JetStream publish acknowledgment, then confirms the advisory ACK with `double_ack()`.
+
+**Verified:** `GPS-RETRY-002` (original stream sequence 11) was stored at DLQ sequence 1. Afterward, `GPS_DLQ_HANDLER` reported zero pending and zero awaiting-ACK messages.
+
+### Experiment 17: Crash Between DLQ Publish and Advisory ACK
+
+The handler published `GPS-RETRY-003` to DLQ sequence 2 and then deliberately exited before acknowledging the advisory. On restart, JetStream redelivered the advisory. The handler used the deterministic `Nats-Msg-Id` `dlq:ORBI_GPS:GPS_PROCESSOR:12`; JetStream returned `duplicate: true`, kept the DLQ message count at 2, and confirmed the advisory acknowledgment.
+
+**Scope:** This demonstrates duplicate suppression **within JetStream's configured deduplication window**. It does not guarantee permanent uniqueness or an atomic transaction spanning publication and acknowledgment.
+
+### Experiment 18: Structured Dead-Letter Records
+
+Updated the handler to publish a JSON envelope containing failure metadata and the original GPS event. `GPS-RETRY-004` was stored at DLQ sequence 3, and an independent `get_raw_message(3)` inspection confirmed the persisted JSON:
+
+```json
+{
+  "dlq_id": "dlq:ORBI_GPS:GPS_PROCESSOR:13",
+  "original_stream": "ORBI_GPS",
+  "original_subject": "orbi.gps.location",
+  "original_sequence": 13,
+  "consumer": "GPS_PROCESSOR",
+  "failure_reason": "MAX_DELIVERIES_EXCEEDED",
+  "delivery_attempts": 3,
+  "failed_at": "2026-10-24T16:29:55.411842444Z",
+  "original_event": {
+    "device_id": "ORBI-001",
+    "event_id": "GPS-RETRY-004",
+    "latitude": 5.6037,
+    "longitude": -0.187,
+    "speed_kmh": 42.5
+  }
+}
+```
+
+`failed_at` is the advisory timestamp, not a captured application exception timestamp. The failure reason indicates exhausted delivery attempts, not the root cause of processing failure.
+
+### Running the Dead-Letter Handler
+
+First configure the streams and consumers:
+
+```bash
+cargo run -p stream-admin
+```
+
+Start the GPS worker and publisher in separate terminals, with the PostgreSQL `DATABASE_URL` environment variable set for the worker:
+
+```bash
+cargo run -p subscriber --bin jetstream_worker
+cargo run -p publisher --bin jetstream_publisher
+```
+
+For a failure advisory already waiting in `ORBI_ADVISORIES`, process one batch using:
+
+```bash
+cargo run -p subscriber --bin dlq_handler
+```
+
+The current DLQ handler processes a fetched batch and exits; it is not yet a continuously running production service. The normal publisher and worker no longer contain the hardcoded simulated-failure condition. Reproducing a maximum-deliveries failure requires controlled fault injection.
+
+### Reliability Boundaries and Next JetStream Milestones
+
+- `Nats-Msg-Id` deduplication is window-limited; durable, long-term DLQ idempotency remains future work.
+- The handler currently expects the original message to remain in `ORBI_GPS` and its payload to be valid JSON. Missing or malformed originals require explicit error handling and a fallback strategy.
+- DLQ advisory processing has its own maximum-delivery limit; exhausted handler retries need monitoring and recovery.
+- A dead-letter record is a copy; it does not delete the original stream message.
+- Automated integration tests, replay tooling, multi-worker coordination, observability, and deployment remain future work.
 
 ## Development Roadmap
 
@@ -515,11 +606,13 @@ The following checklist tracks implemented and experimentally verified capabilit
 - [ ] Message replay and delivery policies
 - [x] JetStream publish acknowledgments
 - [x] Server-confirmed consumer acknowledgments
-- [ ] Retry strategies and acknowledgment timeouts
-- [ ] Maximum delivery attempts and dead-letter handling
+- [x] Retry strategies and acknowledgment timeouts
+- [x] Maximum delivery attempts and dead-letter handling
 - [x] PostgreSQL-backed idempotent GPS inserts
 - [ ] Multiple workers sharing a durable pull consumer
 - [x] Recovery from worker crash after PostgreSQL commit and before ACK
+- [x] DLQ handler crash recovery with window-limited duplicate suppression
+- [x] Structured dead-letter record persistence verified
 - [ ] Reconnection handling and broader failure recovery
 
 ### PostgreSQL and SQLx
@@ -553,8 +646,8 @@ The repository will evolve incrementally, with each major feature supported by p
 
 ## Project Status
 
-**Active development — Core NATS, JetStream persistence, durable consumers, confirmed acknowledgments, PostgreSQL-backed idempotency, and worker crash recovery experimentally verified.**
+**Active development — Core NATS, JetStream persistence, durable consumers, confirmed acknowledgments, PostgreSQL-backed idempotency, retry/backoff policies, persistent failure advisories, structured DLQ handling, and crash recovery experimentally verified.**
 
-Next focus: retry strategies, backoff, maximum delivery attempts, and dead-letter handling.
+**Next focus:** Complete DLQ replay, introduce basic automated integration tests and operational metrics, and explore long-term deduplication strategies before progressing to Apache Kafka with Rust. Kubernetes deployment and advanced observability will follow.
 
 This repository is an evolving engineering lab. Additional messaging capabilities will be introduced and documented as development progresses.

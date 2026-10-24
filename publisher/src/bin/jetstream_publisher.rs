@@ -22,7 +22,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Prepare GPS telemetry.
     let telemetry = GpsTelemetry {
-        event_id: "GPS-CRASH-001".to_string(),
+        event_id: "GPS-RETRY-001".to_string(),
         device_id: "ORBI-001".to_string(),
         latitude: 5.6037,
         longitude: -0.1870,
