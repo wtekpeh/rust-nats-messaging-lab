@@ -78,6 +78,7 @@ rust-nats-messaging-lab/
 │       └── bin/
 │           ├── jetstream_worker.rs
 │           ├── dlq_handler.rs
+│           ├── dlq_replay.rs
 │           └── consumer_info.rs
 ├── stream-admin/
 │   ├── Cargo.toml
@@ -578,7 +579,53 @@ The current DLQ handler processes a fetched batch and exits; it is not yet a con
 - The handler currently expects the original message to remain in `ORBI_GPS` and its payload to be valid JSON. Missing or malformed originals require explicit error handling and a fallback strategy.
 - DLQ advisory processing has its own maximum-delivery limit; exhausted handler retries need monitoring and recovery.
 - A dead-letter record is a copy; it does not delete the original stream message.
-- Automated integration tests, replay tooling, multi-worker coordination, observability, and deployment remain future work.
+- Automated integration tests, generalized replay tooling, multi-worker coordination, observability, and deployment remain future work.
+
+### Experiment 19: Validated Manual DLQ Replay and End-to-End Recovery
+
+Implemented `subscriber/src/bin/dlq_replay.rs` to inspect and manually replay a failed GPS event from `ORBI_GPS_DLQ` back to the original `orbi.gps.location` subject.
+
+**Implementation:**
+
+- Retrieved DLQ sequence 3 directly with `get_raw_message(3)` without consuming or acknowledging it.
+- Deserialized the structured record into strongly typed `DeadLetterRecord` and `GpsTelemetry` Rust structs using Serde.
+- Validated the expected source stream, subject, consumer, failure reason, event and device IDs, finite GPS coordinates within valid ranges, nonnegative finite speed, delivery count, and deterministic DLQ identifier.
+- Defaulted to read-only inspection; publishing requires the explicit `--confirm` command-line argument.
+- Serialized only `original_event` into GPS JSON for the original processing pipeline.
+- Published with deterministic `Nats-Msg-Id` (`replay:dlq:ORBI_GPS:GPS_PROCESSOR:13`) and awaited the JetStream publication acknowledgment.
+- Restarted the normal GPS worker, which inserted the recovered event into PostgreSQL before sending a server-confirmed consumer acknowledgment.
+
+**Verified results:**
+
+| Check | Observed result |
+|---|---|
+| Recovered event | `GPS-RETRY-004` |
+| Original stream sequence | 13 |
+| DLQ sequence | 3 |
+| New `ORBI_GPS` sequence | 14 |
+| Replay publish acknowledgment | Confirmed; `duplicate: false` |
+| `ORBI_GPS` stored messages after replay | 14 |
+| `ORBI_GPS_DLQ` stored messages | 3 (failure history retained) |
+| PostgreSQL rows for `GPS-RETRY-004` | 1 |
+| `GPS_PROCESSOR` pending / awaiting ACK | 0 / 0 |
+
+**Run inspection only:**
+
+```bash
+cargo run -p subscriber --bin dlq_replay
+```
+
+**Explicitly authorize replay:**
+
+```bash
+cargo run -p subscriber --bin dlq_replay -- --confirm
+```
+
+Run `cargo run -p stream-admin` to inspect stream counts, `cargo run -p subscriber --bin consumer_info` to inspect the durable consumer, and query `gps_events` in PostgreSQL to verify persistence. The PostgreSQL-backed worker requires `DATABASE_URL` in its environment.
+
+**Result:** Demonstrated the complete recovery path: failed processing → JetStream retries → maximum-deliveries advisory → structured DLQ record → manual replay → idempotent PostgreSQL persistence → server-confirmed ACK.
+
+**Boundaries:** This is a lab replay tool, not a production replay service. It currently selects fixed DLQ sequence 3, so older unwrapped DLQ records are unsupported. `--confirm` is an operator safeguard, not access control. The deterministic `Nats-Msg-Id` prevents duplicates only within the configured JetStream deduplication window; it does not enforce permanent replay uniqueness or prevent repeated replay loops. No durable replay-status tracking or automated integration test has yet been implemented.
 
 ## Development Roadmap
 
@@ -603,7 +650,8 @@ The following checklist tracks implemented and experimentally verified capabilit
 - [x] Explicit consumer acknowledgments
 - [x] Unacknowledged message redelivery
 - [x] Consumer acknowledgment state inspection
-- [ ] Message replay and delivery policies
+- [x] Validated manual DLQ replay of a selected structured record
+- [ ] Generalized message replay and delivery policies
 - [x] JetStream publish acknowledgments
 - [x] Server-confirmed consumer acknowledgments
 - [x] Retry strategies and acknowledgment timeouts
@@ -646,8 +694,8 @@ The repository will evolve incrementally, with each major feature supported by p
 
 ## Project Status
 
-**Active development — Core NATS, JetStream persistence, durable consumers, confirmed acknowledgments, PostgreSQL-backed idempotency, retry/backoff policies, persistent failure advisories, structured DLQ handling, and crash recovery experimentally verified.**
+**Active development — Core NATS, JetStream persistence, durable consumers, confirmed acknowledgments, PostgreSQL-backed idempotency, retry/backoff policies, persistent failure advisories, structured DLQ handling, crash recovery, and validated manual DLQ replay experimentally verified.**
 
-**Next focus:** Complete DLQ replay, introduce basic automated integration tests and operational metrics, and explore long-term deduplication strategies before progressing to Apache Kafka with Rust. Kubernetes deployment and advanced observability will follow.
+**Next focus:** Add a small set of automated replay-validation tests, then begin a separate Apache Kafka lab using Rust. Generalized DLQ replay, long-term replay deduplication, advanced observability, and Kubernetes deployment remain future improvements.
 
 This repository is an evolving engineering lab. Additional messaging capabilities will be introduced and documented as development progresses.
